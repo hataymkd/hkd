@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "585484681142",
+    "project_id": "hkd-push-9426e",
+    "storage_bucket": "hkd-push-9426e.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:585484681142:android:224635cf4946f2aa7acb17",
+        "android_client_info": {
+          "package_name": "org.hataykuryeler.hkd"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC-FlMVmZCL4EFjjCeKeTjywGp4rE8syYs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
