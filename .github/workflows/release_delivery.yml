@@ -1,0 +1,198 @@
+name: HKD Release Delivery
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release etiketi (ornek: v1.0.5)"
+        required: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hkd-release-${{ github.ref_name || github.event.inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      JAVA_TOOL_OPTIONS: -Xmx4g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Resolve Pubspec Version
+        id: pubspec
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          text = pathlib.Path("pubspec.yaml").read_text(encoding="utf-8")
+          match = re.search(r"^version:\s*([0-9]+\.[0-9]+\.[0-9]+)\+([0-9]+)\s*$", text, re.MULTILINE)
+          if not match:
+              print("pubspec.yaml version formati gecersiz. Beklenen: X.Y.Z+N")
+              sys.exit(1)
+
+          version = match.group(1)
+          build = match.group(2)
+          expected_tag = f"v{version}"
+          output_path = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a", encoding="utf-8") as fh:
+              fh.write(f"version={version}\n")
+              fh.write(f"build={build}\n")
+              fh.write(f"expected_tag={expected_tag}\n")
+          PY
+
+      - name: Resolve Release Tag
+        id: tag
+        run: |
+          EXPECTED_TAG="${{ steps.pubspec.outputs.expected_tag }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.release_tag }}"
+            if [ -z "$TAG" ]; then
+              TAG="$EXPECTED_TAG"
+            fi
+            if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "release_tag formati gecersiz: $TAG (ornek: v1.0.5)"
+              exit 1
+            fi
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [ "$TAG" != "$EXPECTED_TAG" ]; then
+            echo "Tag/pubspec uyusmazligi: tag=$TAG, pubspec_expected=$EXPECTED_TAG"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag dogrulandi: $TAG"
+
+      - name: Flutter Pub Get
+        run: flutter pub get
+
+      - name: Flutter Analyze
+        run: flutter analyze
+
+      - name: Flutter Test
+        run: flutter test
+
+      - name: Configure Android App Link Host
+        env:
+          HKD_APP_LINK_HOST: ${{ secrets.HKD_APP_LINK_HOST }}
+        run: |
+          APP_LINK_HOST="${HKD_APP_LINK_HOST:-hkd-app.pages.dev}"
+          sed -i "s/^HKD_APP_LINK_HOST=.*/HKD_APP_LINK_HOST=$APP_LINK_HOST/" android/gradle.properties
+          echo "Using HKD_APP_LINK_HOST=$APP_LINK_HOST"
+
+      - name: Build Release APK
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          HKD_UPDATE_MANIFEST_URL: ${{ secrets.HKD_UPDATE_MANIFEST_URL }}
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ] || [ -z "$HKD_UPDATE_MANIFEST_URL" ]; then
+            echo "SUPABASE_URL / SUPABASE_ANON_KEY / HKD_UPDATE_MANIFEST_URL secrets zorunlu."
+            exit 1
+          fi
+          flutter build apk --release \
+            --dart-define=APP_ENV=prod \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+            --dart-define=HKD_UPDATE_MANIFEST_URL="$HKD_UPDATE_MANIFEST_URL"
+
+      - name: Generate APK SHA256
+        run: sha256sum build/app/outputs/flutter-apk/app-release.apk > build/app/outputs/flutter-apk/app-release.apk.sha256
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hkd-app-release
+          path: |
+            build/app/outputs/flutter-apk/app-release.apk
+            build/app/outputs/flutter-apk/app-release.apk.sha256
+
+      - name: Create/Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            build/app/outputs/flutter-apk/app-release.apk
+            build/app/outputs/flutter-apk/app-release.apk.sha256
+          fail_on_unmatched_files: true
+
+      - name: Update public release files for deployment
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.pubspec.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+          import re
+          import os
+
+          tag = os.environ["RELEASE_TAG"].strip()
+          repo = os.environ["REPO"].strip()
+          version = os.environ["RELEASE_VERSION"].strip()
+          apk_url = f"https://github.com/{repo}/releases/download/{tag}/app-release.apk"
+          release_page_url = f"https://github.com/{repo}/releases/tag/{tag}"
+
+          version_path = pathlib.Path("public/version.json")
+          data = json.loads(version_path.read_text(encoding="utf-8"))
+          data["latest_version"] = version
+          data["apk_url"] = apk_url
+          data["release_page_url"] = release_page_url
+          version_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+          index_path = pathlib.Path("public/index.html")
+          html = index_path.read_text(encoding="utf-8")
+          html = re.sub(
+              r'href="https://github\.com/[^"]+/releases/download/[^"]+/app-release\.apk"',
+              f'href="{apk_url}"',
+              html,
+              count=1,
+          )
+          html = re.sub(
+              r'href="https://github\.com/[^"]+/releases/tag/[^"]+"',
+              f'href="{release_page_url}"',
+              html,
+              count=1,
+          )
+          index_path.write_text(html, encoding="utf-8")
+          PY
+
+      - name: Deploy Public to Cloudflare Pages
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != '' && secrets.CLOUDFLARE_PAGES_PROJECT != '' }}
+        continue-on-error: true
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy public --project-name ${{ secrets.CLOUDFLARE_PAGES_PROJECT }} --branch main
